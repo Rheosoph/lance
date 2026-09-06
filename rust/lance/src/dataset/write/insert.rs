@@ -147,6 +147,7 @@ impl<'a> InsertBuilder<'a> {
 
     async fn do_commit(context: &WriteContext<'_>, transaction: Transaction) -> Result<Dataset> {
         let mut commit_builder = CommitBuilder::new(context.dest.clone())
+            .with_create_only(context.create_only)
             .use_stable_row_ids(context.params.enable_stable_row_ids)
             .with_exact_storage_format(context.storage_version)
             .enable_v2_manifest_paths(context.params.enable_v2_manifest_paths)
@@ -468,6 +469,7 @@ impl<'a> InsertBuilder<'a> {
         };
 
         Ok(WriteContext {
+            create_only: matches!(params.mode, WriteMode::Create),
             params,
             dest,
             object_store,
@@ -480,6 +482,8 @@ impl<'a> InsertBuilder<'a> {
 
 #[derive(Debug)]
 struct WriteContext<'a> {
+    // Keep the requested mode when validation converts a missing append or overwrite to create.
+    create_only: bool,
     params: WriteParams,
     dest: WriteDestination<'a>,
     object_store: Arc<ObjectStore>,
@@ -789,6 +793,62 @@ mod test {
             dataset.scan().try_into_batch().await.unwrap(),
             record_batch!(("id", Int32, [0, 1, 2])).unwrap()
         );
+    }
+
+    #[rstest]
+    #[case::create(WriteMode::Create)]
+    #[case::overwrite(WriteMode::Overwrite)]
+    #[tokio::test]
+    async fn concurrent_create_preserves_committed_data(#[case] mode: WriteMode) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let uri = tempdir.path().to_str().unwrap();
+        let is_create = matches!(mode, WriteMode::Create);
+        let params = WriteParams {
+            mode,
+            ..Default::default()
+        };
+        let delayed_batch = record_batch!(("id", Int32, [0])).unwrap();
+        let delayed = InsertBuilder::new(uri).with_params(&params);
+        // Stop after the initial existence check and fragment write, before the commit.
+        let (transaction, context) = delayed
+            .write_uncommitted_impl(vec![delayed_batch.clone()])
+            .await
+            .unwrap();
+
+        let winner = InsertBuilder::new(uri)
+            .execute(vec![record_batch!(("id", Int32, [1])).unwrap()])
+            .await
+            .unwrap();
+        let winner = InsertBuilder::new(Arc::new(winner))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![record_batch!(("id", Int32, [2])).unwrap()])
+            .await
+            .unwrap();
+        assert_eq!(winner.get_fragments().len(), 2);
+        let winner_version = winner.version().version;
+
+        let result = InsertBuilder::do_commit(&context, transaction).await;
+        let reopened = Dataset::open(uri).await.unwrap();
+        let rows = reopened
+            .scan()
+            .scan_in_order(true)
+            .try_into_batch()
+            .await
+            .unwrap();
+        if is_create {
+            let error = result.unwrap_err();
+            assert!(matches!(error, Error::DatasetAlreadyExists { .. }));
+            assert!(error.to_string().contains(uri));
+            assert_eq!(reopened.version().version, winner_version);
+            assert_eq!(rows, record_batch!(("id", Int32, [1, 2])).unwrap());
+        } else {
+            result.unwrap();
+            assert_eq!(reopened.version().version, winner_version + 1);
+            assert_eq!(rows, delayed_batch);
+        }
     }
 
     #[tokio::test]
