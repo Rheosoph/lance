@@ -37,6 +37,7 @@ use tracing::info;
 #[derive(Debug, Clone)]
 pub struct CommitBuilder<'a> {
     dest: WriteDestination<'a>,
+    create_only: bool,
     use_stable_row_ids: Option<bool>,
     enable_v2_manifest_paths: bool,
     storage_format: Option<LanceFileVersion>,
@@ -58,6 +59,7 @@ impl<'a> CommitBuilder<'a> {
     pub fn new(dest: impl Into<WriteDestination<'a>>) -> Self {
         Self {
             dest: dest.into(),
+            create_only: false,
             use_stable_row_ids: None,
             enable_v2_manifest_paths: true,
             storage_format: None,
@@ -71,6 +73,13 @@ impl<'a> CommitBuilder<'a> {
             transaction_properties: None,
             timeout: Some(DEFAULT_COMMIT_TIMEOUT),
         }
+    }
+
+    /// Preserve create-only writes when a concurrent writer creates the dataset
+    /// after the insert's initial existence check.
+    pub(super) fn with_create_only(mut self, create_only: bool) -> Self {
+        self.create_only = create_only;
+        self
     }
 
     /// Whether to use stable row ids. This makes the `_rowid` column stable
@@ -303,6 +312,10 @@ impl<'a> CommitBuilder<'a> {
                 }
             }
         };
+
+        if self.create_only && dest.dataset().is_some() {
+            return Err(Error::dataset_already_exists(dest.uri()));
+        }
 
         if dest.dataset().is_none()
             && !matches!(
