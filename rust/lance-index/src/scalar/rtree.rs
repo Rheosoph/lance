@@ -929,8 +929,11 @@ impl RTreeIndexPlugin {
                 let geometry_array = batch.column(0);
                 let bbox_array = extract_bounding_boxes(geometry_array, geometry_field)?;
 
+                // Index files store bounding boxes without the source column's
+                // CRS. File writers reject batches whose extension metadata
+                // differs from the file schema.
                 let bbox_schema = Arc::new(ArrowSchema::new(vec![
-                    bbox_array.extension_type().clone().to_field("bbox", true),
+                    BBOX_FIELD.as_ref().clone().with_nullable(true),
                     ArrowField::new(ROW_ID, DataType::UInt64, false),
                 ]));
                 RecordBatch::try_new(
@@ -1427,6 +1430,35 @@ mod tests {
                 expected_row_ids.insert(i as u64);
             }
         }
+        assert_eq!(row_ids, expected_row_ids);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(LANCE_DF_SPILL_POOL)]
+    async fn test_train_geometry_with_crs() {
+        let metadata = Arc::new(geoarrow_schema::Metadata::new(
+            geoarrow_schema::Crs::from_authority_code("EPSG:4326".into()),
+            None,
+        ));
+        let mut point_builder = PointBuilder::new(PointType::new(Dimension::XY, metadata));
+        for i in 0..100 {
+            let value = f64::from(i);
+            point_builder.push_point(Some(&geo_types::point!(x: value, y: value)));
+        }
+
+        let (rtree_index, _store, _tmpdir) = train_index(&point_builder.finish(), None).await;
+        let mut search_bbox = BoundingBox::new();
+        search_bbox.add_rect(&Rect::new(
+            coord! { x: 9.5, y: 9.5 },
+            coord! { x: 10.5, y: 10.5 },
+        ));
+        let row_ids = rtree_index
+            .search_bbox(search_bbox, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let mut expected_row_ids = RowAddrTreeMap::new();
+        expected_row_ids.insert(10);
         assert_eq!(row_ids, expected_row_ids);
     }
 
